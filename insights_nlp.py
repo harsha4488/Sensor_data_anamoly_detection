@@ -1,24 +1,37 @@
 """
-insights_nlp.py - Lightweight anomaly & log-correlation utilities (no LSTM)
+insights_nlp.py
 
-Exports:
-- preprocess_sensor_data
-- numeric_summary
-- run_all_detectors
+Classical detectors + TF-IDF log correlation.
+- robust preprocessing (force numeric conversion)
+- zscore, iqr
+- isolation_forest, local_outlier_factor (LOF)
+- one_class_svm, elliptic_envelope
+- dbscan
+- pca_reconstruction (standard PCA)
+- run_single_detector, run_all_detectors
 - correlate_anomalies_with_logs
-- map_window_mask_to_index_mask
-- TF_AVAILABLE
+No LSTM here.
 """
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-# TensorFlow flag kept for compatibility (no LSTM in this version)
-TF_AVAILABLE = False
+# sklearn imports
+from sklearn.ensemble import IsolationForest
+from sklearn.neighbors import LocalOutlierFactor
+from sklearn.svm import OneClassSVM
+from sklearn.covariance import EllipticEnvelope
+from sklearn.cluster import DBSCAN
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+TF_AVAILABLE = False  # kept for compatibility
 
 # -------------------------
-# Preprocessing
+# Preprocessing (robust)
 # -------------------------
 def preprocess_sensor_data(
     df: pd.DataFrame,
@@ -27,31 +40,58 @@ def preprocess_sensor_data(
     resample_rule: Optional[str] = None,
     fill_method: str = "ffill"
 ) -> pd.DataFrame:
+    """
+    - Ensures timestamp index (if present)
+    - Converts all non-timestamp columns to numeric where possible
+    - Drops fully-empty numeric columns
+    """
     if df is None:
         raise ValueError("Input dataframe is None")
+
     df = df.copy()
 
-    # Convert timestamp to index if provided
+    # convert timestamp column or index to datetime
     if timestamp_col in df.columns:
         df[timestamp_col] = pd.to_datetime(df[timestamp_col], errors="coerce")
         df = df.dropna(subset=[timestamp_col]).set_index(timestamp_col).sort_index()
-    elif not isinstance(df.index, pd.DatetimeIndex):
-        # attempt to coerce index to datetime
-        try:
-            df.index = pd.to_datetime(df.index)
-        except Exception:
-            raise ValueError("No datetime index and timestamp_col missing or invalid")
+    else:
+        # try index
+        if not isinstance(df.index, pd.DatetimeIndex):
+            try:
+                df.index = pd.to_datetime(df.index)
+            except Exception:
+                # leave as-is; user may handle later
+                pass
 
-    # choose numeric columns
+    # Force numeric conversion for all non-timestamp columns
+    # If value_cols provided, convert only those
+    cols_to_convert = value_cols if value_cols else [c for c in df.columns]
+    for col in cols_to_convert:
+        if col not in df.columns:
+            continue
+        if df[col].dtype == object:
+            # remove common thousands separators and some units
+            df[col] = df[col].astype(str).str.replace(",", "", regex=False)
+            df[col] = df[col].str.replace("%", "", regex=False).str.replace("°", "", regex=False)
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Select numeric columns
     if value_cols:
-        missing = [c for c in value_cols if c not in df.columns]
-        if missing:
-            raise ValueError(f"Missing value columns: {missing}")
-        df_vals = df[value_cols].astype(float)
+        # pick columns that exist and are numeric after conversion
+        df_vals = df[[c for c in value_cols if c in df.columns]].select_dtypes(include=[np.number])
     else:
         df_vals = df.select_dtypes(include=[np.number])
-        if df_vals.shape[1] == 0:
-            raise ValueError("No numeric columns found for anomaly detection.")
+
+    # Drop columns that are entirely NaN
+    df_vals = df_vals.dropna(axis=1, how="all")
+
+    if df_vals.shape[1] == 0:
+        # Helpful error with hint to user
+        raise ValueError(
+            "No numeric columns found after conversion. "
+            "Make sure your CSV contains at least one numeric column. "
+            "Common issues: values with units (e.g. '72°C'), commas as thousands separators, extra quotes, or all values are non-numeric."
+        )
 
     if resample_rule:
         df_vals = df_vals.resample(resample_rule).mean()
@@ -80,11 +120,10 @@ def numeric_summary(series: pd.Series) -> Dict[str, Any]:
     }
 
 # -------------------------
-# Simple detectors (no heavy imports at top)
+# Simple detectors
 # -------------------------
-def _zscore_mask(arr: np.ndarray, z_thresh: float = 3.0) -> np.ndarray:
-    if arr.ndim != 1:
-        arr = arr.ravel()
+def run_zscore(series: np.ndarray, z_thresh: float = 3.0) -> np.ndarray:
+    arr = series.ravel()
     mean = np.nanmean(arr)
     std = np.nanstd(arr)
     if std == 0 or np.isnan(std):
@@ -92,9 +131,8 @@ def _zscore_mask(arr: np.ndarray, z_thresh: float = 3.0) -> np.ndarray:
     z = np.abs((arr - mean) / std)
     return z > z_thresh
 
-def _iqr_mask(arr: np.ndarray, k: float = 1.5) -> np.ndarray:
-    if arr.ndim != 1:
-        arr = arr.ravel()
+def run_iqr(series: np.ndarray, k: float = 1.5) -> np.ndarray:
+    arr = series.ravel()
     q1 = np.nanpercentile(arr, 25)
     q3 = np.nanpercentile(arr, 75)
     iqr = q3 - q1
@@ -103,96 +141,184 @@ def _iqr_mask(arr: np.ndarray, k: float = 1.5) -> np.ndarray:
     return (arr < (q1 - k * iqr)) | (arr > (q3 + k * iqr))
 
 # -------------------------
-# run_all_detectors: returns dictionary expected by app.py
+# ML detectors
+# -------------------------
+def run_isolation_forest(X: np.ndarray, contamination: float = 0.01, random_state: int = 42) -> np.ndarray:
+    clf = IsolationForest(n_estimators=200, contamination=contamination, random_state=random_state)
+    clf.fit(X)
+    preds = clf.predict(X)
+    return preds == -1
+
+def run_lof(X: np.ndarray, n_neighbors: int = 20, contamination: float = 0.01) -> np.ndarray:
+    clf = LocalOutlierFactor(n_neighbors=n_neighbors, contamination=contamination, novelty=False)
+    preds = clf.fit_predict(X)
+    return preds == -1
+
+def run_oneclass_svm(X: np.ndarray, nu: float = 0.01, kernel: str = "rbf") -> np.ndarray:
+    clf = OneClassSVM(nu=nu, kernel=kernel, gamma="scale")
+    clf.fit(X)
+    preds = clf.predict(X)
+    return preds == -1
+
+def run_elliptic_envelope(X: np.ndarray, contamination: float = 0.01) -> np.ndarray:
+    clf = EllipticEnvelope(contamination=contamination)
+    clf.fit(X)
+    preds = clf.predict(X)
+    return preds == -1
+
+def run_dbscan(X: np.ndarray, eps: float = 0.5, min_samples: int = 5) -> np.ndarray:
+    clf = DBSCAN(eps=eps, min_samples=min_samples)
+    labels = clf.fit_predict(X)
+    return labels == -1
+
+def run_pca_reconstruction_error(X: np.ndarray, n_components: Optional[int] = None, multiplier: float = 3.0) -> np.ndarray:
+    if X.ndim == 1:
+        X = X.reshape(-1, 1)
+    n_samples, n_features = X.shape
+    if n_components is None:
+        n_components = min(n_features, max(1, n_features))
+    n_components = min(n_components, n_features)
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X)
+    pca = PCA(n_components=n_components)
+    proj = pca.fit_transform(Xs)
+    recon = pca.inverse_transform(proj)
+    errors = np.mean((Xs - recon) ** 2, axis=1)
+    thr = errors.mean() + multiplier * errors.std()
+    return errors > thr
+
+# -------------------------
+# Dispatcher: single detector
+# -------------------------
+def run_single_detector(
+    df_values: pd.DataFrame,
+    detector_name: str,
+    column: Optional[str] = None,
+    n_components: Optional[int] = None,
+) -> np.ndarray:
+    """
+    Run a single detector and return boolean mask length = n_rows.
+    Only PCA uses n_components.
+    """
+    if df_values is None or df_values.shape[0] == 0:
+        raise ValueError("df_values must be non-empty")
+
+    if column:
+        if column not in df_values.columns:
+            raise ValueError(f"column {column} not found")
+        X = df_values[[column]].values.astype(float)
+    else:
+        X = df_values.values.astype(float)
+
+    vec = X[:, 0] if X.ndim == 2 else X.ravel()
+    name = detector_name.lower()
+
+    if name == "zscore":
+        return run_zscore(vec)
+    elif name == "iqr":
+        return run_iqr(vec)
+    elif name in ("isolation_forest", "isolationforest"):
+        return run_isolation_forest(X)
+    elif name in ("lof", "local_outlier_factor", "local outlier factor"):
+        return run_lof(X)
+    elif name in ("one_class_svm", "one-class-svm", "svm"):
+        return run_oneclass_svm(X)
+    elif name in ("elliptic_envelope", "elliptic"):
+        return run_elliptic_envelope(X)
+    elif name == "dbscan":
+        return run_dbscan(X)
+    elif name in ("pca_recon", "pca_reconstruction", "pca reconstruction"):
+        return run_pca_reconstruction_error(X, n_components=n_components)
+    else:
+        raise ValueError(f"Unknown detector: {detector_name}")
+
+# -------------------------
+# Run all detectors
 # -------------------------
 def run_all_detectors(
     df_values: pd.DataFrame,
     column: Optional[str] = None,
-    rescale: bool = True,
+    pca_n_components: Optional[int] = None
 ) -> Dict[str, Any]:
-    """
-    Run simple detectors and return masks.
-    This implementation purposely avoids heavy imports; placeholders are provided
-    for more advanced detectors.
-    """
     if df_values is None or df_values.shape[0] == 0:
-        raise ValueError("df_values must be non-empty DataFrame")
-
-    if column:
-        if column not in df_values.columns:
-            raise ValueError(f"Column {column} not found in df_values")
-        arr = df_values[[column]].values.flatten()
-    else:
-        arr = df_values.iloc[:, 0].values.flatten()
-
-    n = arr.shape[0]
-
+        raise ValueError("df_values must be non-empty")
     results: Dict[str, Any] = {}
-    # basic statistical detectors
-    results["zscore"] = _zscore_mask(arr)
-    results["iqr"] = _iqr_mask(arr)
+    n_rows = df_values.shape[0]
+    X = df_values.values.astype(float)
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X) if X.size else X
 
-    # placeholders for classical ML detectors (length = n)
-    zero_mask = np.zeros(n, dtype=bool)
-    results["isolation_forest"] = zero_mask.copy()
-    results["local_outlier_factor"] = zero_mask.copy()
-    results["one_class_svm"] = zero_mask.copy()
-    results["elliptic_envelope"] = zero_mask.copy()
-    results["dbscan"] = zero_mask.copy()
-    results["pca_recon"] = zero_mask.copy()
+    vec = Xs[:, 0] if Xs.ndim == 2 else Xs.ravel()
 
-    # No LSTM here — return skipped metadata
-    results["lstm_autoencoder"] = {
-        "skipped": True,
-        "reason": "LSTM removed in this build",
-        "tf_available": TF_AVAILABLE,
-        "window_errors": np.array([]),
-        "window_mask": np.array([]),
-        "window_size": 0
-    }
+    results["zscore"] = run_zscore(vec)
+    results["iqr"] = run_iqr(vec)
 
-    results["meta"] = {"n_rows": n, "n_cols": df_values.shape[1] if hasattr(df_values, "shape") else 1}
+    try:
+        results["isolation_forest"] = run_isolation_forest(Xs)
+    except Exception:
+        results["isolation_forest"] = np.zeros(n_rows, dtype=bool)
+
+    try:
+        results["local_outlier_factor"] = run_lof(Xs)
+    except Exception:
+        results["local_outlier_factor"] = np.zeros(n_rows, dtype=bool)
+
+    try:
+        results["one_class_svm"] = run_oneclass_svm(Xs)
+    except Exception:
+        results["one_class_svm"] = np.zeros(n_rows, dtype=bool)
+
+    try:
+        results["elliptic_envelope"] = run_elliptic_envelope(Xs)
+    except Exception:
+        results["elliptic_envelope"] = np.zeros(n_rows, dtype=bool)
+
+    try:
+        results["dbscan"] = run_dbscan(Xs)
+    except Exception:
+        results["dbscan"] = np.zeros(n_rows, dtype=bool)
+
+    try:
+        results["pca_recon"] = run_pca_reconstruction_error(Xs, n_components=pca_n_components)
+    except Exception:
+        results["pca_recon"] = np.zeros(n_rows, dtype=bool)
+
+    results["meta"] = {"n_rows": n_rows, "n_cols": df_values.shape[1]}
     return results
 
 # -------------------------
-# Log correlation (TF-IDF)
+# TF-IDF log correlation
 # -------------------------
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-
-def correlate_anomalies_with_logs(anomaly_indices: List[int], logs: List[str], top_k: int = 5) -> Dict[int, List[tuple]]:
+def correlate_anomalies_with_logs(anomaly_indices: List[int], logs: List[str], top_k: int = 5) -> Dict[int, List[Tuple[int, float]]]:
     if not logs:
         return {}
     if not isinstance(logs, list):
         raise ValueError("logs must be a list of strings")
-
-    vect = TfidfVectorizer(max_features=2000, stop_words="english")
-    tfidf = vect.fit_transform(logs)  # shape (n_logs, n_features)
-
-    out: Dict[int, List[tuple]] = {}
+    vect = TfidfVectorizer(max_features=3000, stop_words="english")
+    tfidf = vect.fit_transform(logs)
+    out: Dict[int, List[Tuple[int, float]]] = {}
     n_logs = len(logs)
     for idx in anomaly_indices:
-        if not isinstance(idx, int):
-            try:
-                idx = int(idx)
-            except Exception:
-                continue
-        if idx < 0 or idx >= n_logs:
+        try:
+            i = int(idx)
+        except Exception:
             continue
-        sims = cosine_similarity(tfidf[idx], tfidf).flatten()
+        if i < 0 or i >= n_logs:
+            continue
+        sims = cosine_similarity(tfidf[i], tfidf).flatten()
         order = np.argsort(-sims)
-        top = []
+        ranked = []
         for o in order:
-            if o == idx:
+            if o == i:
                 continue
-            top.append((int(o), float(sims[o])))
-            if len(top) >= top_k:
+            ranked.append((int(o), float(sims[o])))
+            if len(ranked) >= top_k:
                 break
-        out[int(idx)] = top
+        out[i] = ranked
     return out
 
 # -------------------------
-# Utility: map window mask (not used but kept for compatibility)
+# Utility (compat)
 # -------------------------
 def map_window_mask_to_index_mask(n_rows: int, window_size: int, window_mask: np.ndarray) -> np.ndarray:
     mask = np.zeros(n_rows, dtype=bool)
@@ -203,10 +329,11 @@ def map_window_mask_to_index_mask(n_rows: int, window_size: int, window_mask: np
             mask[i:i + window_size] = True
     return mask
 
-# explicit exports
+# expose names
 __all__ = [
     "preprocess_sensor_data",
     "numeric_summary",
+    "run_single_detector",
     "run_all_detectors",
     "correlate_anomalies_with_logs",
     "map_window_mask_to_index_mask",
